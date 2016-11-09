@@ -36,6 +36,18 @@ if !exists('g:templates_fuzzy_start')
 	let g:templates_fuzzy_start = 1
 endif
 
+if !exists('g:templates_search_height')
+	" First try to find the deprecated option
+	if exists('g:template_max_depth')
+		echom('g:template_max_depth is deprecated in favor of g:templates_search_height')
+		let g:templates_search_height = g:template_max_depth != 0 ? g:template_max_depth : -1
+	endif
+
+	if(!exists('g:templates_search_height'))
+		let g:templates_search_height = -1
+	endif
+endif
+
 if !exists('g:templates_directory')
 	let g:templates_directory = []
 elseif type(g:templates_directory) == type('')
@@ -196,10 +208,16 @@ function <SID>TDirectorySearch(path, template_prefix, file_name)
 	" Use find if possible as it will also get hidden files on nix systems. Use
 	" builtin glob as a fallback
 	if executable("find") && !has("win32") && !has("win64")
-		let l:find_cmd = '`find ''' . a:path . ''' -maxdepth 1 -type f -name ''' . a:template_prefix . '*''`'
+		let l:find_cmd = '`find -L ' . shellescape(a:path) . ' -maxdepth 1 -type f -name ' . shellescape(a:template_prefix . '*' ) . '`'
 		call <SID>Debug("Executing " . l:find_cmd)
 		let l:glob_results = glob(l:find_cmd)
-	else
+		if v:shell_error != 0
+			call <SID>Debug("Could not execute find command")
+			unlet l:glob_results
+		endif
+	endif
+	if !exists("l:glob_results")
+		call <SID>Debug("Using fallback glob")
 		let l:glob_results = glob(a:path . a:template_prefix . "*")
 	endif
 	let l:templates = split(l:glob_results, "\n")
@@ -231,38 +249,36 @@ endfunction
 
 " Searches for a [template] in a given [path].
 "
-" If [upwards] is [1] the template is searched only in the given directory;
-" if it's zero it is searched all along the directory structure, going to
-" parent directory whenever a template is *not* found for a given [path]. If
-" it's greater than zero [upwards] is the maximum depth of directories that
-" will be traversed.
+" If [height] is [-1] the template is searched for in the given directory and
+" all parents in its directory structure
+"
+" If [height] is [0] no searching is done in the given directory or any
+" parents
+"
+" If [height] is [1] only the given directory is searched
+"
+" If [height] is greater than one, n parents and the given directory will be
+" searched where n is equal to height - 1
 "
 " If no template is found an empty string is returned.
 "
-function <SID>TSearch(path, template_prefix, file_name, upwards)
-	" pick a template from the current path
-	let l:picked_template = <SID>TDirectorySearch(a:path, a:template_prefix, a:file_name)
+function <SID>TSearch(path, template_prefix, file_name, height)
+	if (a:height != 0)
 
-	if l:picked_template != ""
-		if !has("win32") || !has("win64")
+		" pick a template from the current path
+		let l:picked_template = <SID>TDirectorySearch(a:path, a:template_prefix, a:file_name)
+		if l:picked_template != ""
 			return l:picked_template
 		else
-			echoerr( "Not yet implemented" )
-			" TODO
-			" return a:path . <SID>TFindLink(a:path, a:template)
-		endif
-	else
-		" File not found/not readable.
-		if (a:upwards == 0) || (a:upwards > 1)
-			" Check wether going upwards results in a different path...
 			let l:pathUp = <SID>DirName(a:path)
 			if l:pathUp != a:path
-				" ...and traverse it.
-				return <SID>TSearch(l:pathUp, a:template_prefix, a:file_name, a:upwards ? a:upwards-1 : 0)
+				let l:new_height = a:height >= 0 ? a:height - 1 : a:height
+				return <SID>TSearch(l:pathUp, a:template_prefix, a:file_name, l:new_height)
 			endif
 		endif
 	endif
-	" Ooops, either we cannot go up in the path or [upwards] reached 1
+
+	" Ooops, either we cannot go up in the path or [height] reached 0
 	return ""
 endfunction
 
@@ -319,6 +335,8 @@ function <SID>TExpandVars()
 	let l:day        = strftime("%d")
 	let l:year       = strftime("%Y")
 	let l:month      = strftime("%m")
+	let l:monshort   = strftime("%b")
+	let l:monfull    = strftime("%B")
 	let l:time       = strftime("%H:%M")
 	let l:date       = exists("g:dateformat") ? strftime(g:dateformat) :
 				     \ (l:year . "-" . l:month . "-" . l:day)
@@ -344,6 +362,8 @@ function <SID>TExpandVars()
 	call <SID>TExpand("USER",  l:user)
 	call <SID>TExpand("FDATE", l:fdate)
 	call <SID>TExpand("MONTH", l:month)
+	call <SID>TExpand("MONTHSHORT", l:monshort)
+	call <SID>TExpand("MONTHFULL",  l:monfull)
 	call <SID>TExpand("FILE",  l:filen)
 	call <SID>TExpand("FFILE", l:filec)
 	call <SID>TExpand("FDIR",  l:fdir)
@@ -402,10 +422,9 @@ function <SID>TLoad()
 
 	let l:file_name = expand("%:p")
 	let l:file_dir = <SID>DirName(l:file_name)
-	let l:depth = exists("g:template_max_depth") ? g:template_max_depth : 0
-
+	let l:depth = g:templates_search_height
 	let l:tFile = <SID>TFind(l:file_dir, l:file_name, l:depth)
-	call <SID>TLoadTemplate(l:tFile)
+	call <SID>TLoadTemplate(l:tFile, 0)
 endfunction
 
 
@@ -414,22 +433,22 @@ endfunction
 " a template suffix (and the template is searched as usual). Of course this
 " makes variable expansion and cursor positioning.
 "
-function <SID>TLoadCmd(template)
+function <SID>TLoadCmd(template, position)
 	if filereadable(a:template)
 		let l:tFile = a:template
 	else
-		let l:depth = exists("g:template_max_depth") ? g:template_max_depth : 0
+		let l:height = g:templates_search_height
 		let l:tName = g:templates_global_name_prefix . a:template
 		let l:file_name = expand("%:p")
 		let l:file_dir = <SID>DirName(l:file_name)
 
-		let l:tFile = <SID>TFind(l:file_dir, a:template, l:depth)
+		let l:tFile = <SID>TFind(l:file_dir, a:template, l:height)
 	endif
-	call <SID>TLoadTemplate(l:tFile)
+	call <SID>TLoadTemplate(l:tFile, a:position)
 endfunction
 
 " Load the given file as a template
-function <SID>TLoadTemplate(template)
+function <SID>TLoadTemplate(template, position)
 	if a:template != ""
 		let l:deleteLastLine = 0
 		if line('$') == 1 && getline(1) == ''
@@ -438,12 +457,16 @@ function <SID>TLoadTemplate(template)
 
 		" Read template file and expand variables in it.
 		let l:safeFileName = <SID>NeuterFileName(a:template)
-		execute "keepalt 0r " . l:safeFileName
+		if a:position == 0
+			execute "keepalt 0r " . l:safeFileName
+		else
+			execute "keepalt r " . l:safeFileName
+		endif
 		call <SID>TExpandVars()
 
 		if l:deleteLastLine == 1
 			" Loading a template into an empty buffer leaves an extra blank line at the bottom, delete it
-			execute line('$') . "d"
+			execute line('$') . "d _"
 		endif
 
 		call <SID>TPutCursor()
@@ -466,7 +489,8 @@ fun ListTemplateSuffixes(A,P,L)
 
   return l:res
 endfun
-command -nargs=1 -complete=customlist,ListTemplateSuffixes Template call <SID>TLoadCmd("<args>")
+command -nargs=1 -complete=customlist,ListTemplateSuffixes Template call <SID>TLoadCmd("<args>", 0)
+command -nargs=1 -complete=customlist,ListTemplateSuffixes TemplateHere call <SID>TLoadCmd("<args>", 1)
 
 " Syntax autocommands {{{1
 "
